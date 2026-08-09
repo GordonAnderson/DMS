@@ -711,8 +711,9 @@ void setup()
   // Init the PWM outputs
   initPWM();
   tc1configure(1200000, 10);
+  Serial1.begin(115200);
+  cp.registerStream(&Serial1);
   Serial.begin(0);
-  //Serial1.begin(9600);
   cp.registerStream(&Serial);
   cp.selectStream(&Serial);
   cp.registerCommands(&dbsList);
