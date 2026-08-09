@@ -23,7 +23,7 @@
 // "OFF" command does not actually remove power yet.
 #define OFF         digitalWrite(POWER,LOW)
 // Disable input voltage monitor
-//#define NOINA237
+#define NOINA237
 
 // Digitial output line used for 12 bit PWM
 #define DRIVE       4
