@@ -146,11 +146,16 @@ void tcDisable(Tc *tc)
 
 void setFreqDuty(int frequency, int duty)
 {
+  // Guard against divide-by-zero: SFREQ range-checks dms.Freq before it gets
+  // here, but the TC1 debug command passes its argument straight through
+  // with no range check, so a bad value (e.g. TC1,0,50) must not reach the
+  // division below.
+  if(frequency <= 0) return;
   // Set frequency
-  TC1->COUNT16.CC[0].reg = VARIANT_MCK / frequency; 
-  while (tcIsSyncing(TC2));
+  TC1->COUNT16.CC[0].reg = VARIANT_MCK / frequency;
+  while (tcIsSyncing(TC1));  // was TC2 - TC2 isn't touched here, so that wait was a no-op
   // Set duty cycle
-  TC1->COUNT16.CC[1].reg = ((VARIANT_MCK / frequency) * duty) / 100; 
+  TC1->COUNT16.CC[1].reg = ((VARIANT_MCK / frequency) * duty) / 100;
   while (tcIsSyncing(TC1));
 }
 

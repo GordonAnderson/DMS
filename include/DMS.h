@@ -56,7 +56,8 @@ typedef enum
   SCAN_CVactive,          // A CV sweep is currently running (performCVscan)
   SCAN_CVcomplete,        // The current CV sweep's points are all acquired
   SCAN_ABORT,             // SCNSTP was received; scan is unwinding
-  SCAN_FAILED,            // Reserved; not currently set anywhere
+  SCAN_FAILED,            // performScan()'s Vrf-step loop broke early for a
+                          // reason other than SCAN_ABORT (unexpected)
   SCAN_ALLOCATIONfailed   // Heap allocation for the scan buffer failed
 } ScanStatus;
 

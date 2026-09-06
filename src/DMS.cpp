@@ -71,6 +71,25 @@
 //  1.4, Mar 19, 2026
 //    - process the enable command when received, not just set the enable flag
 //    - Fixed averaging bug when set to 2
+//  1.5, Sep 5, 2026
+//    - Fixed RNUMSCANS: command table was calling through an int variable
+//      instead of the numScans() function pointer (crashed on use)
+//    - allocateScanBuffer() now checks/zero-inits the cvscan pointer array
+//      so an allocation failure can't null-deref or free garbage pointers
+//    - CVscanISR no longer commands one CV step past CVend on the last
+//      point of a sweep
+//    - Fixed setFreqDuty() waiting on the wrong timer's sync flag, and
+//      guarded it (and the TC1 debug command) against divide-by-zero
+//    - scanStatus/scanNow/scanFlag marked volatile (set from ISRs, polled
+//      in plain loops on the main thread)
+//    - RSCNPOS/RSCNNEG (reportElec()) could never report data for the Vrf
+//      step currently being acquired, only already-completed ones
+//    - performScan() left a partially-built scanBuffer in place after a
+//      failed allocation, which could crash a later RSCNPOS/RSCNNEG/RSCNPTS
+//      or the next SCNSTRT retry; freeScanBuffer() also hardened against a
+//      NULL top-level cvscan array
+//    - performScan()/SCANSTAT no longer report an aborted or unexpectedly
+//      failed scan as "Finished" (new SCAN_FAILED status for the latter)
 
 
 #include "Arduino.h"
@@ -112,7 +131,7 @@
 #undef  USB_PRODUCT
 #define USB_PRODUCT      "DMS Rev 1"
 
-const char *Version = "DMS, version 1.4 Mar 19, 2026";
+const char *Version = "DMS, version 1.5 Sep 5, 2026";
 //Adafruit_BME280 bme(BME280_CS);       // hardware SPI
 Adafruit_BME280 bme;                    // hardware TWI
 
@@ -134,8 +153,11 @@ char  baseFileName[20]  = "";         // base file name, each scan appends .xxxx
 int   numSchScans       = 0;          // number of scan to perform
 int   interval          = 15;         // seconds between scans
 int   collectedScan     = 0;
-bool  scanFlag          = false;      // this flag is true during a scan
-bool  scanNow           = false;      // this flag is set to flag a scan to start, monitoried in the main loop
+// scanFlag/scanNow are set from the RTC alarm ISR (scanTime()) and polled in
+// a plain loop()/while() on the main thread, so they must be volatile or the
+// compiler is free to cache the read and never observe the ISR's write.
+volatile bool  scanFlag          = false;      // this flag is true during a scan
+volatile bool  scanNow           = false;      // this flag is set to flag a scan to start, monitoried in the main loop
 
 // Pin definitions for the onboard DotStar
 // On the ItsyBitsy M4, the DotStar is connected to specific pins.
@@ -259,7 +281,9 @@ bool fs_formatted = false;
 bool fs_changed = true;
 
 // Scan parameters
-ScanStatus scanStatus  = SCAN_IDLE;
+// volatile: set from CVscanISR() (TC3 interrupt context) and polled in a
+// plain while() loop in performCVscan() on the main thread.
+volatile ScanStatus scanStatus  = SCAN_IDLE;
 Scan       *scanBuffer = NULL;
 float      CVstep;
 float      VRFstep;
@@ -383,7 +407,7 @@ Command dbsCmds[] =
 // Scan data read commands
   {"RSCNPOS", CMDfunction, 3, (void *)reportPosElec,NULL,        "Report positive electrometer channel data. scan num,scan point,numvalues"},
   {"RSCNNEG", CMDfunction, 3, (void *)reportNegElec,NULL,        "Report negative electrometer channel data. scan num,scan point,numvalues"},
-  {"RNUMSCANS", CMDfunction, 0, (void *)numSchScans,NULL,        "Returns the number of recorded scans"},
+  {"RNUMSCANS", CMDfunction, 0, (void *)numScans,NULL,           "Returns the number of recorded scans"},
   {"RSCNPTS",   CMDfunction, 1, (void *)scanPoints,NULL,         "Returns the number of recorded points in selected scan"},
 // Scan file IO command
   {"SSCAN",   CMDfunction, 1, (void *)saveScan,NULL,             "Save scan to file system"},
@@ -865,13 +889,16 @@ void setTCC(void)
   pwmWrite(ch,count);
 }
 // TC1,<freq>,<duty>: sets the FAIMS RF drive frequency/duty directly,
-// bypassing dms.Freq/dms.Duty.
+// bypassing dms.Freq/dms.Duty. Unlike SFREQ this does not go through the
+// rngFREQ-checked Command table path, so a bad frequency (0, or negative)
+// is guarded here to avoid a divide-by-zero in setFreqDuty().
 void setTC1(void)
 {
   int freq,duty;
 
   cp.getValue(&freq);
   cp.getValue(&duty);
+  if(freq <= 0) return;
   setFreqDuty(freq,duty);
 }
 // ADCS: prints raw (uncalibrated) analogRead() counts for all five analog
@@ -971,37 +998,45 @@ void SetBias(void)
   cp.sendACK();
 }
 
+// Tears down scanBuffer, whether it's a complete scan or a partially-built
+// one left behind by an allocateScanBuffer() failure (see performScan()) --
+// the `cvscan != NULL` guard below is what makes the latter case safe: if
+// the top-level `cvscan` pointer array itself never allocated, there is
+// nothing under it to walk/free.
 void freeScanBuffer(void)
 {
     if (scanBuffer == NULL) return; // Nothing to free
 
     // 1. Free each CVscan object
-    for (int i = 0; i < scanBuffer->Points; ++i) 
+    if (scanBuffer->cvscan != NULL)
     {
-        if (scanBuffer->cvscan[i] != NULL) 
-        {
-          // Free the data buffers
-          if(scanBuffer->cvscan[i]->dataPos != NULL)
+      for (int i = 0; i < scanBuffer->Points; ++i)
+      {
+          if (scanBuffer->cvscan[i] != NULL)
           {
-            delete[] scanBuffer->cvscan[i]->dataPos;
-            scanBuffer->cvscan[i]->dataPos = NULL;
+            // Free the data buffers
+            if(scanBuffer->cvscan[i]->dataPos != NULL)
+            {
+              delete[] scanBuffer->cvscan[i]->dataPos;
+              scanBuffer->cvscan[i]->dataPos = NULL;
+            }
+            if(scanBuffer->cvscan[i]->dataNeg != NULL)
+            {
+              delete[] scanBuffer->cvscan[i]->dataNeg;
+              scanBuffer->cvscan[i]->dataNeg = NULL;
+            }
+            // Each entry was allocated with scalar `new CVscan` (see
+            // allocateScanBuffer), so it must be freed with scalar delete,
+            // not delete[].
+            delete scanBuffer->cvscan[i];
+            scanBuffer->cvscan[i] = NULL; // Good practice to nullify dangling pointers
           }
-          if(scanBuffer->cvscan[i]->dataNeg != NULL)
-          {
-            delete[] scanBuffer->cvscan[i]->dataNeg;
-            scanBuffer->cvscan[i]->dataNeg = NULL;
-          }
-          // Each entry was allocated with scalar `new CVscan` (see
-          // allocateScanBuffer), so it must be freed with scalar delete,
-          // not delete[].
-          delete scanBuffer->cvscan[i];
-          scanBuffer->cvscan[i] = NULL; // Good practice to nullify dangling pointers
-        }
+      }
+      // cvscan is a `new CVscan*[n]` array of pointers, so it needs delete[].
+      delete[] scanBuffer->cvscan;
     }
-    // 2. Free the Scan structure itself. cvscan is a `new CVscan*[n]` array
-    // of pointers, so it needs delete[]; scanBuffer itself was a scalar
-    // `new Scan`, so it needs plain delete.
-    delete[] scanBuffer->cvscan;
+    // 2. Free the Scan structure itself; it was a scalar `new Scan`, so it
+    // needs plain delete.
     delete scanBuffer;
     scanBuffer = NULL; // Reset global pointer
 }
@@ -1021,7 +1056,13 @@ bool allocateScanBuffer(void)
   scanBuffer->Averages = dms.Averages;
 
   //size_t CVscanSize = sizeof(CVscan *);
-  scanBuffer->cvscan = new(std::nothrow) CVscan *[dms.VRFsteps];
+  // The trailing () value-initializes the array, zeroing every pointer.
+  // That matters if allocation fails partway through the loop below: the
+  // not-yet-allocated slots must read back as NULL (not indeterminate
+  // garbage) so freeScanBuffer()'s "if(cvscan[i] != NULL) delete ..." can
+  // tell real pointers from unallocated ones instead of deleting garbage.
+  scanBuffer->cvscan = new(std::nothrow) CVscan *[dms.VRFsteps]();
+  if(scanBuffer->cvscan == NULL) return false;
 
   // Allocate the array of CVscan structs
   for(int i=0;i<dms.VRFsteps;i++)
@@ -1052,22 +1093,35 @@ bool allocateScanBuffer(void)
 // the current Vrf step have been acquired.
 void CVscanISR(void)
 {
+  CVscan *cvscan = scanBuffer->cvscan[scanBuffer->Acquired];
+
   // Exit if all points are acquired
-  if(scanBuffer->cvscan[scanBuffer->Acquired]->Acquired >= scanBuffer->cvscan[scanBuffer->Acquired]->Points) 
+  if(cvscan->Acquired >= cvscan->Points)
   {
     scanStatus = SCAN_CVcomplete;
     return;
   }
   // Save the voltages in the data scanBuffer
-  scanBuffer->cvscan[scanBuffer->Acquired]->dataPos[scanBuffer->cvscan[scanBuffer->Acquired]->Acquired] = LastADCval[0];
-  scanBuffer->cvscan[scanBuffer->Acquired]->dataNeg[scanBuffer->cvscan[scanBuffer->Acquired]->Acquired++] = LastADCval[1];
-  // Advance the CV voltage to the next point
-  float cv = scanBuffer->cvscan[scanBuffer->Acquired]->CVstart;
-  cv += CVstep * scanBuffer->cvscan[scanBuffer->Acquired]->Acquired;
+  cvscan->dataPos[cvscan->Acquired]   = LastADCval[0];
+  cvscan->dataNeg[cvscan->Acquired++] = LastADCval[1];
+  // If that was the last point, flag completion now rather than falling
+  // through to command one more CV step beyond CVend (see fix note below)
+  // and waiting for the next tick to notice Acquired >= Points.
+  if(cvscan->Acquired >= cvscan->Points)
+  {
+    scanStatus = SCAN_CVcomplete;
+    return;
+  }
+  // Advance the CV voltage to the next point. Only reached when Acquired is
+  // still a valid point index, so this never exceeds CVend (previously it
+  // computed CVstart + CVstep*Points == CVend + CVstep on the last point of
+  // a sweep and briefly drove DCB1/DCB2 one step past the configured range).
+  float cv = cvscan->CVstart;
+  cv += CVstep * cvscan->Acquired;
   dms.DCB1v =  cv/2 + dms.Bias;
   dms.DCB2v = -cv/2 + dms.Bias;
   DACupdate(dms.DCB1v, &dms.DCB1ctrl);
-  DACupdate(dms.DCB2v, &dms.DCB2ctrl); 
+  DACupdate(dms.DCB2v, &dms.DCB2ctrl);
 }
 
 // Runs one CV sweep (one column of the 2-D scan) at the current Vrf level:
@@ -1184,19 +1238,41 @@ bool performScan(bool ackFlag)
     }
     if(dataPos != NULL) delete[] dataPos;
     if(dataNeg != NULL) delete[] dataNeg;
-    scanStatus = SCAN_FINISHED;
+    // Only report SCAN_FINISHED if every Vrf step actually completed --
+    // the for loop above only reaches Acquired == Points by running to
+    // completion; a `break` (SCNSTP abort, or an unexpected performCVscan()
+    // failure) leaves Acquired < Points. Previously this unconditionally
+    // stomped scanStatus to SCAN_FINISHED (and always returned true), so an
+    // aborted scan was indistinguishable from a completed one via SCANSTAT.
+    // scanStatus already holds SCAN_ABORT in the expected abort case;
+    // anything else that broke out early is flagged SCAN_FAILED instead.
+    bool completed = (scanBuffer->Acquired >= scanBuffer->Points);
+    if(completed) scanStatus = SCAN_FINISHED;
+    else if(scanStatus != SCAN_ABORT) scanStatus = SCAN_FAILED;
     SetVrf(dms.Vrf = 500);
-    return true;
+    return completed;
   }
-  // Here if allocation failed
+  // Here if allocation failed. allocateScanBuffer() may have partially
+  // built the Scan/CVscan structures before running out of memory; free
+  // whatever it managed to allocate and reset scanBuffer to NULL so every
+  // other consumer's "if(scanBuffer != NULL)" check can keep assuming a
+  // non-NULL scanBuffer is fully valid rather than dereferencing a
+  // half-built one (this previously left a stale scanBuffer around that
+  // could crash a later RSCNPOS/RSCNNEG/RSCNPTS or the next SCNSTRT retry).
+  freeScanBuffer();
   scanStatus = SCAN_ALLOCATIONfailed;
   return false;
 }
 
 void StartScan(void)
 {
-  if(performScan(true)) return;
-  else cp.sendNAK();
+  // performScan(true) sends its own ACK as soon as the scan buffer is
+  // successfully allocated, before the (possibly long) scan actually runs;
+  // a false return after that point means the scan was aborted or failed
+  // partway through, which is reported via SCANSTAT, not a second reply to
+  // this command. Only NAK here for the "never even started" case -- i.e.
+  // allocation failed and no ACK was sent at all.
+  if(!performScan(true) && (scanStatus == SCAN_ALLOCATIONfailed)) cp.sendNAK();
 }
 
 void StopScan(void)
@@ -1224,6 +1300,9 @@ void ScanStat(void)
       break;
     case SCAN_ABORT:
       cp.println("Abort");
+      break;
+    case SCAN_FAILED:
+      cp.println("Failed");
       break;
     case SCAN_ALLOCATIONfailed:
       cp.println("Allocation failed");
@@ -1628,7 +1707,17 @@ void reportElec(bool pos)
    if(!cp.getValue(&num,1,scanBuffer->cvscan[scanNum-1]->Points)) return(cp.sendNAK());
    // See if data is avalible
    cp.sendACK(false);
-   if(scanNum > scanBuffer->Acquired) return(cp.println(0));
+   // scanBuffer->Acquired counts Vrf steps that have FULLY completed; the
+   // step currently being acquired (if any) is index scanBuffer->Acquired
+   // itself (0-based) and hasn't been counted yet, so its 1-based scanNum
+   // is scanBuffer->Acquired + 1. The bound below must allow that scanNum
+   // through so a scan in progress can be read live (per the file header's
+   // "read the scan data while it is being acquired"); it previously
+   // rejected exactly that case, making RSCNPOS/RSCNNEG always report 0 for
+   // the scan currently running even though RSCNPTS (scanPoints()) would
+   // show it already had points. The per-point check just below still
+   // limits the actual read to only the points acquired so far.
+   if(scanNum > scanBuffer->Acquired + 1) return(cp.println(0));
    if(scanIndex > scanBuffer->cvscan[scanNum-1]->Acquired) return(cp.println(0));
    if((num + scanIndex) > scanBuffer->cvscan[scanNum-1]->Acquired) return(cp.println(0));
    // Now report the data

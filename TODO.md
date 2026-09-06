@@ -1,104 +1,150 @@
 # TODO / Known Issues
 
-Bugs and risk items found during a code review pass (2026-08-08). None of
-these have been fixed unless noted — they need a decision from someone who
-can validate against real hardware, or are flagged here specifically so they
-don't get silently "fixed" by someone unaware of the context.
+Bugs and risk items found during code review passes. Fixed items are kept
+here (marked Fixed) as a record of what changed and why, so the reasoning
+isn't lost; open items need a decision from someone who can validate against
+real hardware, or are flagged so they don't get silently "fixed" by someone
+unaware of the context.
 
-## Bugs
+## Fixed — 2026-09-05 (v1.5)
 
-### 1. `readScan()` stores the wrong value into scan data buffers
-**File:** [src/DMS.cpp](src/DMS.cpp) — inside `readScan()`, the two per-point
-read loops (positive and negative electrometer data).
+### `RNUMSCANS` command crashed when used
+**File:** [src/DMS.cpp](src/DMS.cpp) — the `dbsCmds` command table.
+
+The table entry cast the wrong symbol to a function pointer:
+```cpp
+{"RNUMSCANS", CMDfunction, 0, (void *)numSchScans,NULL, "Returns the number of recorded scans"},
+```
+`numSchScans` is the `int` variable used by the SCHEDULE feature (number of
+scans to perform), not the `numScans()` function that actually reports the
+recorded-scan count. The command dispatcher does
+`void (*function)(void) = (void (*)(void))c->pointer; function();`, so
+sending `RNUMSCANS` jumped execution to whatever small integer value
+`numSchScans` held — a near-certain crash. Fixed to `(void *)numScans`.
+
+### `allocateScanBuffer()` could null-deref or free garbage pointers
+**File:** [src/DMS.cpp](src/DMS.cpp) — `allocateScanBuffer()`.
+
+`scanBuffer->cvscan = new(std::nothrow) CVscan *[dms.VRFsteps];` was used
+without checking the result before the following loop dereferenced it, and
+`new T*[n]` does not zero-initialize the array — so if allocation failed
+partway through populating entries, the un-populated slots held
+indeterminate garbage rather than NULL, which `freeScanBuffer()` would later
+try to `delete`. Fixed by value-initializing the array (`...[dms.VRFsteps]()`,
+which zeroes every pointer) and checking it for NULL before use.
+
+### `CVscanISR()` commanded one CV step past `CVend`
+**File:** [src/DMS.cpp](src/DMS.cpp) — `CVscanISR()`.
+
+On the tick that recorded the last valid point of a CV sweep, the function
+still fell through to the step-advance code and drove DCB1/DCB2 to
+`CVstart + CVstep*Points`, i.e. `CVend + CVstep` — one step beyond the
+configured range — for up to one `CVstepDuration` before the next tick
+noticed completion. Fixed: completion is now flagged immediately after
+recording the last point, so the sweep never commands a voltage past CVend.
+
+### `setFreqDuty()` waited on the wrong timer, and could divide by zero
+**File:** [src/Timers.cpp](src/Timers.cpp) — `setFreqDuty()`.
+
+Wrote `TC1->COUNT16.CC[0].reg` (frequency) but waited on `tcIsSyncing(TC2)`
+— TC2 isn't touched by this function, so the wait did nothing to confirm the
+frequency write had taken effect before the duty write followed. Also
+divided by `frequency` with no guard; `SFREQ` range-checks `dms.Freq` before
+it reaches here, but the `TC1,<freq>,<duty>` debug command
+([src/DMS.cpp](src/DMS.cpp), `setTC1()`) passed its argument straight
+through unchecked, so `TC1,0,50` would divide by zero. Fixed the sync wait
+to check `TC1`, and added a `frequency <= 0` guard both in `setFreqDuty()`
+and in `setTC1()`.
+
+### `scanStatus`/`scanNow`/`scanFlag` not `volatile`
+**Files:** [src/DMS.cpp](src/DMS.cpp).
+
+`scanStatus` is written by `CVscanISR()` (TC3 interrupt context) and polled
+in a plain `while(true){...}` loop in `performCVscan()` on the main thread;
+`scanNow`/`scanFlag` have the same pattern between the RTC alarm ISR
+(`scanTime()`) and `loop()`. None were declared `volatile`, so the compiler
+was technically free to cache a read and never observe the ISR's write —
+this "worked" only because the loop bodies call external functions the
+compiler can't prove are side-effect-free. All three are now `volatile`.
+
+### `RSCNPOS`/`RSCNNEG` could never report data for the scan in progress
+**File:** [src/DMS.cpp](src/DMS.cpp) — `reportElec()` (shared by both
+commands).
 
 ```cpp
-Value2Counts(fval,&dms.POSELECmon);
-scanBuffer->cvscan[i]->dataPos[j] = fval;
+if(scanNum > scanBuffer->Acquired) return(cp.println(0));
 ```
+`scanBuffer->Acquired` counts Vrf steps that have *fully* completed; the
+step currently being acquired is 0-based index `Acquired` itself and hasn't
+been counted yet, so its 1-based `scanNum` is `Acquired + 1`. Since
+`Acquired + 1 > Acquired` is always true, this check rejected exactly the
+scan that's actively running — `RSCNPOS`/`RSCNNEG` always reported "0
+values" for it, no matter how many points had already landed. This
+contradicted the file header's own description of the read commands
+("Commands alow reading the scan data while it is being acquired") and was
+inconsistent with the sibling command `RSCNPTS` (`scanPoints()`), which has
+no such gate and correctly reports live progress. Fixed the bound to
+`scanNum > scanBuffer->Acquired + 1`; the existing per-point check just
+below it already correctly limits what's actually read to points acquired
+so far, so no data can be read out ahead of when it's written.
 
-The call to `Value2Counts()` converts the ASCII engineering value (`fval`,
-e.g. a pA reading written by `saveScanAscii()` via `Counts2Value()`) back to
-raw ADC counts — but the **return value is discarded**, and the raw
-engineering-unit float is truncated straight into a `uint16_t` counts slot
-instead. Every scan reloaded with `RSCAN` ends up with nonsense data (e.g. a
-3.45 pA reading becomes a raw count of `3`), and any later `RSCNPOS`/`RSCNNEG`
-report or re-save of that scan will apply calibration a second time on top of
-already-wrong data.
+### A failed scan allocation left a stale, unsafe `scanBuffer` around
+**File:** [src/DMS.cpp](src/DMS.cpp) — `performScan()`, `freeScanBuffer()`.
 
-**Fix:** use the conversion result:
-```cpp
-scanBuffer->cvscan[i]->dataPos[j] = Value2Counts(fval,&dms.POSELECmon);
-...
-scanBuffer->cvscan[i]->dataNeg[j] = Value2Counts(fval,&dms.NEGELECmon);
-```
-Same pattern appears twice (positive and negative loops).
+If `allocateScanBuffer()` failed partway through (plausible with a large
+`VRFsteps`/`CVsteps` request on a 192KB-RAM part), `performScan()` recorded
+`SCAN_ALLOCATIONfailed` and returned false, but never freed or NULLed the
+global `scanBuffer` — leaving it non-NULL but only partially built, an
+invariant nothing else in the file expects (`RSCNPOS`/`RSCNNEG`/`RSCNPTS`
+and `freeScanBuffer()`'s own retry path all trust that a non-NULL
+`scanBuffer` is fully valid). Depending on exactly where allocation failed,
+a subsequent `RSCNPOS`/`RSCNNEG`/`RSCNPTS`, or simply retrying `SCNSTRT`
+(which calls `freeScanBuffer()` first), could dereference an unpopulated
+`cvscan[i]` slot or index through a NULL top-level `cvscan` array. Fixed by
+having `performScan()` call `freeScanBuffer()` on the allocation-failure
+path, and hardening `freeScanBuffer()` itself to skip the `cvscan[]` walk
+entirely when the top-level array is NULL, so it can safely tear down a
+partially-built scan buffer from any failure point.
 
-### 2. `scanPoints()` off-by-one lets an out-of-range scan index through
-**File:** [src/DMS.cpp](src/DMS.cpp) — `scanPoints()`.
+### Aborting a scan was reported as "Finished"
+**File:** [src/DMS.cpp](src/DMS.cpp) — `performScan()`, `StartScan()`,
+`ScanStat()`. **File:** [include/DMS.h](include/DMS.h) — `ScanStatus` enum.
 
-```cpp
-scn--;
-...
-if(scn > scanBuffer->Points) return(cp.println(0));
-cp.println(scanBuffer->cvscan[scn]->Acquired);
-```
+At the end of the Vrf-step loop, `performScan()` unconditionally set
+`scanStatus = SCAN_FINISHED` and returned `true`, even when the loop broke
+early because `SCNSTP` set `scanStatus = SCAN_ABORT` (or some other
+unexpected `performCVscan()` failure). So `SCANSTAT` reported "Finished"
+after a deliberate abort, and `StartScan()`/`SCNSTRT` never reflected that
+the scan didn't actually complete. Fixed: `scanStatus` is now only set to
+`SCAN_FINISHED` when the loop reached every Vrf step (`Acquired >= Points`);
+an early break preserves `SCAN_ABORT` if that's why it stopped, or sets the
+previously-unused `SCAN_FAILED` enum value (added to `ScanStat()`'s switch)
+for any other case. `performScan()`'s return value now reflects real
+completion too — which also means `scanAndSave()` (the scheduled-scan
+feature) no longer saves a scan file for a run that was aborted or failed
+partway through. `StartScan()` was adjusted to match: it only sends a NAK
+when `performScan()` never got as far as sending its own ACK (i.e.
+`SCAN_ALLOCATIONfailed`), since a false return after that point (abort/
+failure) must not add a second, unsolicited reply to the same `SCNSTRT`
+command — that outcome is reported via `SCANSTAT`.
 
-Valid indices into `scanBuffer->cvscan[]` are `0 .. Points-1`. The guard only
-rejects `scn > Points`, so `scn == Points` slips through and dereferences one
-element past the end of the array (`cvscan[Points]`), reading whatever memory
-follows the allocation.
+## Fixed — 2026-08-08 (earlier review pass)
 
-**Fix:** change the comparison to `>=`.
-
-### 3. `freeScanBuffer()` frees scalar allocations with array `delete[]`
-**File:** [src/DMS.cpp](src/DMS.cpp) — `freeScanBuffer()`.
-
-`scanBuffer` and each `scanBuffer->cvscan[i]` are allocated with scalar
-placement-`new`-style calls (`new(std::nothrow) Scan`, `new(std::nothrow)
-CVscan`), but freed with `delete[]`:
-
-```cpp
-delete[] scanBuffer->cvscan[i];   // cvscan[i] was `new CVscan`, not `new CVscan[n]`
-...
-delete[] scanBuffer;              // scanBuffer was `new Scan`, not `new Scan[n]`
-```
-
-Mismatched scalar-`new`/array-`delete` is undefined behavior per the C++
-standard — the misleading comments above these lines ("we allocated as
-unsigned char[]") don't match what the code actually does. It happens to work
-on this runtime's allocator today, but should be corrected to plain `delete`
-to match the scalar `new`.
-
-### 4. Averaged scans don't stop on abort/failure mid-average
-**File:** [src/DMS.cpp](src/DMS.cpp) — `performScan()`.
-
-The first CV sweep for a given Vrf step checks the result and bails out:
-```cpp
-if(!performCVscan()) break;
-```
-but the inner averaging loop that repeats the sweep for `dms.Averages > 1`
-does not:
-```cpp
-for(int i=2;i<=scanBuffer->Averages;i++)
-{
-  scanBuffer->cvscan[scanBuffer->Acquired]->Acquired = 0;
-  performCVscan();                     // return value ignored
-  for(int k=0; ...) dataPos[k] += scanBuffer->cvscan[...]->dataPos[k];
-  ...
-}
-```
-If a scan is aborted (`SCNSTP`) or fails partway through an averaging run,
-the loop keeps summing whatever partial/stale data is left in the buffer
-into the running total, and the final average silently includes bad data
-instead of the scan being reported as failed/aborted.
-
-**Suggested fix:** check `performCVscan()`'s return value here too and break
-out of both loops (propagating the abort) the same way the primary call
-does.
+The four items below were found in the 2026-08-08 review and have since
+been fixed in the code (this section is kept only as a record — none of
+them are still open):
+- `readScan()` discarded the result of `Value2Counts()` instead of storing
+  it, corrupting reloaded scan data.
+- `scanPoints()` had an off-by-one range check (`>` instead of `>=`) that
+  let one out-of-range index through.
+- `freeScanBuffer()` freed scalar `new` allocations with array `delete[]`.
+- The CV-averaging loop in `performScan()` didn't check `performCVscan()`'s
+  return value on repeats, so an abort/failure mid-average still got
+  coadded into the result.
 
 ## Needs hardware verification (not changed)
 
-### 5. `RED`/`GREEN` DotStar color macros may be swapped
+### `RED`/`GREEN` DotStar color macros may be swapped
 **File:** [src/DMS.cpp](src/DMS.cpp), near the `statusLED()` helper:
 ```cpp
 #define RED    strip.Color(0, 150, 0)
@@ -114,7 +160,7 @@ the two definitions if they're indeed backwards.
 
 ## Known limitations (intentional, documented in code, listed here so they stay visible)
 
-### 6. `OFF` doesn't currently turn power off
+### `OFF` doesn't currently turn power off
 **File:** [include/DMS.h](include/DMS.h):
 ```cpp
 #define ON          digitalWrite(POWER,LOW)
@@ -128,9 +174,23 @@ noting it here so it isn't lost, and so a firmware change elsewhere doesn't
 accidentally start relying on `OFF` actually cutting power before the
 hardware supports it safely.
 
+### `dms.MaxOnTime` is declared but never implemented
+**File:** [include/DMS.h](include/DMS.h):
+```cpp
+float MaxOnTime; // Defines the number of hours before the system automatically shuts down
+```
+This field is persisted in `DMSdata` (and read/written by `saveDefaults()`/
+`loadDefaults()`), but nothing in the firmware ever reads it — there's no
+`SMAXONTIME`/`GMAXONTIME` command and no check against elapsed on-time
+anywhere in `Update()` or `loop()`. The auto-shutdown safety behavior the
+comment describes does not currently exist. Flagging here rather than
+implementing it, since doing so is a feature decision (what "shuts down"
+should mean, interacting with the `OFF`-doesn't-cut-power limitation above)
+rather than a bug fix.
+
 ## Build system
 
-### 7. `src/FlashFS/` is a duplicated copy of `GAACE_Core`'s FatFs sources
+### `src/FlashFS/` is a duplicated copy of `GAACE_Core`'s FatFs sources
 `GAACE_Core`'s `library.json` excludes its own `src/FlashFS/` folder from the
 library build (`"build": {"srcFilter": ["+<*>", "-<FlashFS>"]}`), and the
 library's include path only covers `src/`, not `src/FlashFS/`. That means
